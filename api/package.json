@@ -1,0 +1,17 @@
+{
+  "name": "steelers-api",
+  "version": "1.0.0",
+  "description": "Azure Functions API for Kobe Steelers fan site (messages)",
+  "main": "src/functions/*.js",
+  "scripts": {
+    "start": "func start"
+  },
+  "dependencies": {
+    "@azure/functions": "^4.5.0",
+    "applicationinsights": "^2.9.5",
+    "mssql": "^11.0.1"
+  },
+  "devDependencies": {
+    "azure-functions-core-tools": "^4.x"
+  }
+}
