@@ -5,6 +5,8 @@
     "FUNCTIONS_WORKER_RUNTIME": "node",
     "SQL_SERVER": "",
     "SQL_DATABASE": "",
+    "SQL_USER": "",
+    "SQL_PASSWORD": "",
     "APPLICATIONINSIGHTS_CONNECTION_STRING": ""
   }
 }

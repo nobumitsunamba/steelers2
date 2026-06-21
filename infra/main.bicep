@@ -2,17 +2,14 @@
 // コベルコ神戸スティーラーズ ファンサイト API インフラ
 //
 // 構成:
-//   - Microsoft.Sql/servers            : Entra ID 認証のみ(SQL認証無効)
+//   - Microsoft.Sql/servers            : SQL 認証（管理者ログイン/パスワード）
 //   - Microsoft.Sql/servers/databases  : Serverless (GP_S_Gen5_1, Auto-pause 60分)
-//   - Microsoft.Web/sites (Function App): System-assigned Managed Identity 付与
-//   - Microsoft.Resources/deploymentScripts:
-//       Function App の Managed Identity を DB ユーザーとして自動登録
-//       (CREATE USER FROM EXTERNAL PROVIDER + db_datareader / db_datawriter)
+//   - Microsoft.Web/sites (Function App): mssql から SQL 認証で接続
 //
 // 認証方針:
-//   SQL 認証は無効化(azureADOnlyAuthentication: true)。
-//   サーバー管理者には User-assigned Managed Identity を Entra 管理者として設定し、
-//   その ID を使って deploymentScript から Function App の MI を DB ユーザー登録する。
+//   アプリ(Functions)は SQL 認証(SQL_USER / SQL_PASSWORD)で接続する。
+//   管理者パスワードは平文でコミットせず、@secure() パラメータとして
+//   デプロイ時に Azure CLI の --parameters や GitHub Actions Secrets から渡す。
 // =============================================================================
 
 @description('リソースを作成するリージョン')
@@ -24,6 +21,14 @@ param namePrefix string = 'steelers'
 @description('リソース名の一意性を担保するためのサフィックス')
 param nameSuffix string = uniqueString(resourceGroup().id)
 
+@description('SQL Server の管理者ログイン名（アプリの SQL_USER に利用）')
+param sqlAdminLogin string = 'steelersadmin'
+
+@description('SQL Server の管理者パスワード。平文でコミットせず、デプロイ時に安全に渡すこと。')
+@secure()
+@minLength(12)
+param sqlAdminPassword string
+
 var sqlServerName = '${namePrefix}-sql-${nameSuffix}'
 var sqlDatabaseName = '${namePrefix}-db'
 var functionAppName = '${namePrefix}-func-${nameSuffix}'
@@ -31,47 +36,24 @@ var planName = '${namePrefix}-plan-${nameSuffix}'
 var storageName = toLower('${namePrefix}st${nameSuffix}')
 var logName = '${namePrefix}-logs-${nameSuffix}'
 var appInsightsName = '${namePrefix}-ai-${nameSuffix}'
-var sqlAdminIdentityName = '${namePrefix}-sqladmin-${nameSuffix}'
 
 // -----------------------------------------------------------------------------
-// SQL 管理者となる User-assigned Managed Identity
-// deploymentScript はこの ID で sqlcmd を実行し、DB ユーザーを作成する。
-// -----------------------------------------------------------------------------
-resource sqlAdminIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
-  name: sqlAdminIdentityName
-  location: location
-}
-
-// -----------------------------------------------------------------------------
-// Azure SQL Server (Entra ID 認証のみ)
+// Azure SQL Server (SQL 認証)
 // -----------------------------------------------------------------------------
 resource sqlServer 'Microsoft.Sql/servers@2023-08-01-preview' = {
   name: sqlServerName
   location: location
-  identity: {
-    type: 'UserAssigned'
-    userAssignedIdentities: {
-      '${sqlAdminIdentity.id}': {}
-    }
-  }
   properties: {
     version: '12.0'
     minimalTlsVersion: '1.2'
     publicNetworkAccess: 'Enabled'
-    // SQL 認証は使わず、Entra 管理者として User-assigned MI を設定する。
-    administrators: {
-      administratorType: 'ActiveDirectory'
-      principalType: 'Application'
-      login: sqlAdminIdentity.name
-      sid: sqlAdminIdentity.properties.principalId
-      tenantId: subscription().tenantId
-      // SQL 認証を無効化(Entra ID 認証のみ)。
-      azureADOnlyAuthentication: true
-    }
+    // SQL 認証の管理者。パスワードは @secure() パラメータから渡す。
+    administratorLogin: sqlAdminLogin
+    administratorLoginPassword: sqlAdminPassword
   }
 }
 
-// deploymentScript(ACI) や Function App から接続できるよう、Azure サービスを許可する。
+// Function App など Azure サービスから接続できるよう許可する。
 resource allowAzureServices 'Microsoft.Sql/servers/firewallRules@2023-08-01-preview' = {
   parent: sqlServer
   name: 'AllowAllAzureIps'
@@ -152,16 +134,12 @@ resource plan 'Microsoft.Web/serverfarms@2023-12-01' = {
 }
 
 // -----------------------------------------------------------------------------
-// Function App (System-assigned Managed Identity 付与)
+// Function App (mssql から SQL 認証で接続)
 // -----------------------------------------------------------------------------
 resource functionApp 'Microsoft.Web/sites@2023-12-01' = {
   name: functionAppName
   location: location
   kind: 'functionapp,linux'
-  // System-assigned Managed Identity を付与。
-  identity: {
-    type: 'SystemAssigned'
-  }
   properties: {
     serverFarmId: plan.id
     httpsOnly: true
@@ -198,7 +176,7 @@ resource functionApp 'Microsoft.Web/sites@2023-12-01' = {
           name: 'APPLICATIONINSIGHTS_CONNECTION_STRING'
           value: appInsights.properties.ConnectionString
         }
-        // DB アクセス設定（接続文字列ではなく Managed Identity 認証）。
+        // DB アクセス設定（SQL 認証）。SQL_PASSWORD は @secure() パラメータ由来。
         {
           name: 'SQL_SERVER'
           value: sqlServer.properties.fullyQualifiedDomainName
@@ -207,62 +185,17 @@ resource functionApp 'Microsoft.Web/sites@2023-12-01' = {
           name: 'SQL_DATABASE'
           value: sqlDatabaseName
         }
+        {
+          name: 'SQL_USER'
+          value: sqlAdminLogin
+        }
+        {
+          name: 'SQL_PASSWORD'
+          value: sqlAdminPassword
+        }
       ]
     }
   }
-}
-
-// -----------------------------------------------------------------------------
-// deploymentScript: Function App の Managed Identity を DB ユーザー登録する
-//
-// SQL 管理者である User-assigned MI(sqlAdminIdentity)で go-sqlcmd を実行し、
-//   CREATE USER [<functionApp>] FROM EXTERNAL PROVIDER;
-//   ALTER ROLE db_datareader ADD MEMBER [<functionApp>];
-//   ALTER ROLE db_datawriter ADD MEMBER [<functionApp>];
-// を流す。Serverless の Auto-pause 復帰待ちのためリトライする。
-// -----------------------------------------------------------------------------
-resource registerSqlUser 'Microsoft.Resources/deploymentScripts@2023-08-01' = {
-  name: 'register-${functionAppName}-sql-user'
-  location: location
-  kind: 'AzureCLI'
-  identity: {
-    type: 'UserAssigned'
-    userAssignedIdentities: {
-      '${sqlAdminIdentity.id}': {}
-    }
-  }
-  properties: {
-    azCliVersion: '2.55.0'
-    retentionInterval: 'PT1H'
-    timeout: 'PT30M'
-    cleanupPreference: 'OnSuccess'
-    environmentVariables: [
-      {
-        name: 'SQL_SERVER_FQDN'
-        value: sqlServer.properties.fullyQualifiedDomainName
-      }
-      {
-        name: 'SQL_DATABASE'
-        value: sqlDatabaseName
-      }
-      {
-        name: 'FUNCTION_APP_NAME'
-        value: functionApp.name
-      }
-      {
-        // go-sqlcmd が User-assigned MI を選択するためのクライアント ID。
-        name: 'AAD_CLIENT_ID'
-        value: sqlAdminIdentity.properties.clientId
-      }
-    ]
-    // スクリプト本体は別ファイルから読み込む（loadTextContent は ${} を
-    // Bicep 補間しないため、bash の変数展開をそのまま記述できる）。
-    scriptContent: loadTextContent('register-sql-user.sh')
-  }
-  dependsOn: [
-    allowAzureServices
-    sqlDatabase
-  ]
 }
 
 // -----------------------------------------------------------------------------
