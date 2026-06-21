@@ -130,3 +130,43 @@ jobs:
           SQL_ADMIN_PASSWORD: ${{ secrets.SQL_ADMIN_PASSWORD }}
           SQL_SERVER_FQDN: ${{ steps.deploy.outputs.sql_server_fqdn }}
           SQL_DATABASE: ${{ steps.deploy.outputs.sql_database }}
+
+      - name: Configure Static Web App settings
+        # フロントの /api/* を処理する Static Web Apps の managed API に、
+        # DB 接続設定（SQL 認証）を投入する。SWA 名は未指定ならリソースグループ
+        # 内から自動検出する（azure/login でホストの az は認証済み）。
+        shell: bash
+        run: |
+            set -euo pipefail
+
+            RG="${SWA_RESOURCE_GROUP:-$AZURE_RESOURCE_GROUP}"
+            SWA_NAME="${STATIC_WEBAPP_NAME:-}"
+            if [ -z "${SWA_NAME}" ]; then
+              # リソースグループ内の Static Web App を自動検出する。
+              SWA_NAME=$(az staticwebapp list --resource-group "${RG}" \
+                --query "[0].name" -o tsv)
+            fi
+            if [ -z "${SWA_NAME}" ]; then
+              echo "No Static Web App found in resource group ${RG}." >&2
+              exit 1
+            fi
+
+            echo "Configuring app settings on Static Web App: ${SWA_NAME}"
+            az staticwebapp appsettings set \
+              --name "${SWA_NAME}" \
+              --resource-group "${RG}" \
+              --setting-names \
+                SQL_SERVER="${SQL_SERVER_FQDN}" \
+                SQL_DATABASE="${SQL_DATABASE}" \
+                SQL_USER="${SQL_ADMIN_LOGIN:-steelersadmin}" \
+                SQL_PASSWORD="${SQL_ADMIN_PASSWORD}" 1>/dev/null
+            echo "Static Web App settings configured."
+        env:
+          AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+          # SWA が別リソースグループ/別名の場合に上書きするための任意変数。
+          SWA_RESOURCE_GROUP: ${{ vars.AZURE_STATIC_WEBAPP_RG }}
+          STATIC_WEBAPP_NAME: ${{ vars.AZURE_STATIC_WEBAPP_NAME }}
+          SQL_ADMIN_LOGIN: ${{ vars.SQL_ADMIN_LOGIN }}
+          SQL_ADMIN_PASSWORD: ${{ secrets.SQL_ADMIN_PASSWORD }}
+          SQL_SERVER_FQDN: ${{ steps.deploy.outputs.sql_server_fqdn }}
+          SQL_DATABASE: ${{ steps.deploy.outputs.sql_database }}
