@@ -1,0 +1,131 @@
+# Azure インフラ(Bicep)のデプロイと DB スキーマ適用を自動化するワークフロー。
+#
+# 必要な GitHub 設定:
+#   Secrets:
+#     AZURE_CREDENTIALS    : azure/login 用のサービスプリンシパル JSON
+#                            （`az ad sp create-for-rbac --sdk-auth` の出力）
+#     SQL_ADMIN_PASSWORD   : SQL Server 管理者パスワード（@secure パラメータに渡す）
+#   Variables:
+#     AZURE_RESOURCE_GROUP : デプロイ先リソースグループ名
+#     SQL_ADMIN_LOGIN      : SQL 管理者ログイン名（任意。未設定なら steelersadmin）
+#
+# 手動実行(workflow_dispatch)、または main の infra/ ・ api/schema.sql 変更時に実行する。
+name: Deploy Infra (Bicep)
+
+on:
+  workflow_dispatch:
+    inputs:
+      apply_schema:
+        description: 'デプロイ後に api/schema.sql を適用する'
+        type: boolean
+        default: true
+  push:
+    branches:
+      - main
+    paths:
+      - 'infra/**'
+      - 'api/schema.sql'
+      - '.github/workflows/deploy-infra.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-infra-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy Bicep & apply schema
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Deploy main.bicep
+        id: deploy
+        uses: azure/cli@v2
+        with:
+          inlineScript: |
+            set -euo pipefail
+            outputs=$(az deployment group create \
+              --resource-group "${AZURE_RESOURCE_GROUP}" \
+              --template-file infra/main.bicep \
+              --parameters sqlAdminLogin="${SQL_ADMIN_LOGIN:-steelersadmin}" \
+              --parameters sqlAdminPassword="${SQL_ADMIN_PASSWORD}" \
+              --query properties.outputs -o json)
+
+            # Bicep の出力を後続ステップへ受け渡す。
+            echo "sql_server_fqdn=$(echo "$outputs" | jq -r '.sqlServerFqdn.value')" >> "$GITHUB_OUTPUT"
+            echo "sql_database=$(echo "$outputs" | jq -r '.sqlDatabaseName.value')" >> "$GITHUB_OUTPUT"
+            echo "function_app=$(echo "$outputs" | jq -r '.functionAppName.value')" >> "$GITHUB_OUTPUT"
+        env:
+          AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+          SQL_ADMIN_LOGIN: ${{ vars.SQL_ADMIN_LOGIN }}
+          SQL_ADMIN_PASSWORD: ${{ secrets.SQL_ADMIN_PASSWORD }}
+
+      - name: Apply schema.sql
+        # push 時は常に、手動実行時は apply_schema=true のときのみ実行する。
+        if: ${{ github.event_name == 'push' || inputs.apply_schema }}
+        uses: azure/cli@v2
+        with:
+          inlineScript: |
+            set -euo pipefail
+
+            FQDN="${SQL_SERVER_FQDN}"
+            SERVER_NAME="${FQDN%%.*}"   # FQDN から SQL サーバーのリソース名を抽出
+
+            # GitHub ランナーは Azure サービス枠の外なので、一時的に
+            # ランナーの送信元 IP を許可するファイアウォール規則を追加する。
+            RUNNER_IP=$(curl -sf https://api.ipify.org)
+            RULE_NAME="gh-runner-$(date +%s)"
+            echo "Adding temporary firewall rule ${RULE_NAME} for ${RUNNER_IP}"
+            az sql server firewall-rule create \
+              --resource-group "${AZURE_RESOURCE_GROUP}" \
+              --server "${SERVER_NAME}" \
+              --name "${RULE_NAME}" \
+              --start-ip-address "${RUNNER_IP}" \
+              --end-ip-address "${RUNNER_IP}" 1>/dev/null
+
+            # 後始末は失敗しても必ず行う。
+            cleanup() {
+              echo "Removing temporary firewall rule ${RULE_NAME}"
+              az sql server firewall-rule delete \
+                --resource-group "${AZURE_RESOURCE_GROUP}" \
+                --server "${SERVER_NAME}" \
+                --name "${RULE_NAME}" 1>/dev/null || true
+            }
+            trap cleanup EXIT
+
+            # go-sqlcmd（単一バイナリ）を取得して SQL 認証でスキーマを適用する。
+            curl -sSL -o sqlcmd.tar.bz2 \
+              https://github.com/microsoft/go-sqlcmd/releases/download/v1.8.0/sqlcmd-linux-amd64.tar.bz2
+            tar -xjf sqlcmd.tar.bz2
+            chmod +x ./sqlcmd
+
+            # Serverless の Auto-pause 復帰待ちのためリトライ（最大6回 / 20秒間隔）。
+            attempt=1
+            until ./sqlcmd -S "${FQDN}" -d "${SQL_DATABASE}" \
+                    -U "${SQL_ADMIN_LOGIN:-steelersadmin}" -P "${SQL_ADMIN_PASSWORD}" \
+                    -N -C -b -i api/schema.sql
+            do
+              if [ "${attempt}" -ge 6 ]; then
+                echo "Failed to apply schema after ${attempt} attempts."
+                exit 1
+              fi
+              echo "Attempt ${attempt} failed (DB may be resuming). Retrying in 20s..."
+              attempt=$((attempt + 1))
+              sleep 20
+            done
+            echo "schema.sql applied."
+        env:
+          AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+          SQL_ADMIN_LOGIN: ${{ vars.SQL_ADMIN_LOGIN }}
+          SQL_ADMIN_PASSWORD: ${{ secrets.SQL_ADMIN_PASSWORD }}
+          SQL_SERVER_FQDN: ${{ steps.deploy.outputs.sql_server_fqdn }}
+          SQL_DATABASE: ${{ steps.deploy.outputs.sql_database }}
