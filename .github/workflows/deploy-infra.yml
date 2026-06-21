@@ -71,10 +71,11 @@ jobs:
 
       - name: Apply schema.sql
         # push 時は常に、手動実行時は apply_schema=true のときのみ実行する。
+        # azure/login でホストの az が認証済みのため、ホスト上で実行する
+        # （azure/cli コンテナには tar が無く go-sqlcmd を展開できないため）。
         if: ${{ github.event_name == 'push' || inputs.apply_schema }}
-        uses: azure/cli@v2
-        with:
-          inlineScript: |
+        shell: bash
+        run: |
             set -euo pipefail
 
             FQDN="${SQL_SERVER_FQDN}"
